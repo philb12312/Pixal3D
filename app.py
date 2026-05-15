@@ -127,6 +127,26 @@ def init_models():
         if pipeline is not None:
             return
 
+        # GPU / CUDA Diagnostics (runs when GPU is allocated)
+        import subprocess as _sp
+        print("=" * 60)
+        print("[Diagnostics] PyTorch version:", torch.__version__)
+        print("[Diagnostics] CUDA available:", torch.cuda.is_available())
+        if torch.cuda.is_available():
+            print("[Diagnostics] CUDA version:", torch.version.cuda)
+            print("[Diagnostics] cuDNN version:", torch.backends.cudnn.version())
+            for i in range(torch.cuda.device_count()):
+                name = torch.cuda.get_device_name(i)
+                cap = torch.cuda.get_device_capability(i)
+                mem = torch.cuda.get_device_properties(i).total_memory / 1024**3
+                print(f"[Diagnostics] GPU {i}: {name}, sm_{cap[0]}{cap[1]}, {mem:.1f} GB")
+        try:
+            res = _sp.run(["nvidia-smi", "--query-gpu=name,compute_cap,memory.total", "--format=csv,noheader"], capture_output=True, text=True, timeout=10)
+            print("[Diagnostics] nvidia-smi:", res.stdout.strip())
+        except Exception as e:
+            print(f"[Diagnostics] nvidia-smi failed: {e}")
+        print("=" * 60)
+
         model_path = "TencentARC/Pixal3D"
         print(f"[Pipeline] Loading from {model_path}...")
         pipeline = Pixal3DImageTo3DPipeline.from_pretrained(model_path)
@@ -226,51 +246,46 @@ def unpack_state(state_path):
     return shape_slat, tex_slat, int(data['res'])
 
 # ============================================================================
-# Progress Tracking (SSE-based, tqdm interception, multi-session)
+# Progress Tracking (file-based, cross-process safe for @spaces.GPU)
 # ============================================================================
 
 import asyncio
-import queue
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse
 from fastapi import Request
 
-# Per-session progress queues
-_progress_queues: Dict[str, queue.Queue] = {}
+PROGRESS_DIR = os.path.join(TMP_DIR, '_progress')
+os.makedirs(PROGRESS_DIR, exist_ok=True)
+
 _thread_local = threading.local()
+
+def _progress_file(session_id: str) -> str:
+    """Return path to a session's progress JSON file."""
+    return os.path.join(PROGRESS_DIR, f"{session_id}.json")
 
 def _reset_progress(session_id: str):
     _thread_local.active_session = session_id
-    if session_id not in _progress_queues:
-        _progress_queues[session_id] = queue.Queue()
-    # Drain old items
-    q = _progress_queues[session_id]
-    while not q.empty():
-        try:
-            q.get_nowait()
-        except:
-            break
+    _write_progress_file(session_id, {"stage": "Initializing...", "step": 0, "total": 0, "done": False})
 
 def _update_progress(stage: str, step: int, total: int):
-    data = {"stage": stage, "step": step, "total": total, "done": False}
     session_id = getattr(_thread_local, 'active_session', '')
-    if session_id and session_id in _progress_queues:
-        try:
-            _progress_queues[session_id].put_nowait(data)
-        except:
-            pass
+    if session_id:
+        _write_progress_file(session_id, {"stage": stage, "step": step, "total": total, "done": False})
 
 def _finish_progress():
     session_id = getattr(_thread_local, 'active_session', '')
-    if session_id and session_id in _progress_queues:
-        try:
-            _progress_queues[session_id].put_nowait({"done": True})
-        except:
-            pass
-        # Schedule cleanup after a short delay (let SSE client receive the done signal)
-        def _cleanup():
-            time.sleep(5)
-            _progress_queues.pop(session_id, None)
-        threading.Thread(target=_cleanup, daemon=True).start()
+    if session_id:
+        _write_progress_file(session_id, {"done": True})
+
+def _write_progress_file(session_id: str, data: dict):
+    """Atomically write progress JSON to a file (cross-process safe)."""
+    path = _progress_file(session_id)
+    tmp_path = path + ".tmp"
+    try:
+        with open(tmp_path, 'w') as f:
+            json.dump(data, f)
+        os.replace(tmp_path, path)  # atomic on POSIX
+    except Exception:
+        pass
 
 # Monkey-patch tqdm to intercept progress
 import tqdm as _tqdm_module
@@ -314,34 +329,16 @@ async def homepage():
         return HTMLResponse(content=f.read())
 
 @app.get("/progress")
-async def progress_sse(request: Request):
-    """SSE endpoint for real-time progress updates during generation."""
+async def progress_poll(request: Request):
+    """Polling endpoint for real-time progress updates during generation."""
     session_id = request.query_params.get("session_id", "")
-    if session_id and session_id not in _progress_queues:
-        _progress_queues[session_id] = queue.Queue()
-    
-    async def event_stream():
-        q = _progress_queues.get(session_id)
-        timeout_count = 0
-        while True:
-            if q:
-                try:
-                    data = q.get_nowait()
-                    yield f"data: {json.dumps(data)}\n\n"
-                    if data.get("done"):
-                        break
-                    timeout_count = 0
-                except queue.Empty:
-                    yield f": keepalive\n\n"
-                    timeout_count += 1
-            else:
-                yield f": keepalive\n\n"
-                timeout_count += 1
-            # Timeout after 5 minutes of no data
-            if timeout_count > 1000:
-                break
-            await asyncio.sleep(0.3)
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    path = _progress_file(session_id)
+    try:
+        with open(path, 'r') as f:
+            data = json.load(f)
+        return JSONResponse(data)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return JSONResponse({"stage": "Waiting...", "step": 0, "total": 0, "done": False})
 
 @app.api()
 @spaces.GPU(duration=30)
@@ -371,6 +368,8 @@ def generate_3d(
     tex_slat_guidance_rescale: float = 0.0,
     tex_slat_sampling_steps: int = 12,
     tex_slat_rescale_t: float = 3.0,
+    manual_fov: float = -1.0,
+    fov_unit: str = "deg",
     session_id: str = "",
 ) -> Dict:
     init_models()
@@ -386,11 +385,28 @@ def generate_3d(
     temp_processed_path = os.path.join(TMP_DIR, f"temp_proc_{session_id[:8]}_{int(time.time()*1000)}.png")
     image_preprocessed.save(temp_processed_path)
     
-    camera_params = get_camera_params_wild_moge(
-        temp_processed_path, device="cuda",
-        mesh_scale=WILD_MESH_SCALE, extend_pixel=WILD_EXTEND_PIXEL,
-        image_resolution=WILD_IMAGE_RESOLUTION,
-    )
+    if manual_fov > 0:
+        # Convert to radians based on unit
+        if fov_unit == "rad":
+            camera_angle_x = float(manual_fov)
+            fov_deg = math.degrees(manual_fov)
+        else:
+            camera_angle_x = math.radians(manual_fov)
+            fov_deg = float(manual_fov)
+        grid_point = torch.tensor([-1.0, 0.0, 0.0])
+        distance = distance_from_fov(
+            camera_angle_x, grid_point,
+            torch.tensor([0 - WILD_EXTEND_PIXEL, WILD_IMAGE_RESOLUTION - 1 + WILD_EXTEND_PIXEL]),
+            WILD_MESH_SCALE, WILD_IMAGE_RESOLUTION
+        )["distance_from_x"]
+        camera_params = {'camera_angle_x': camera_angle_x, 'distance': distance, 'mesh_scale': WILD_MESH_SCALE}
+        print(f"[Camera] Using manual FOV: {fov_deg:.2f}° ({camera_angle_x:.4f} rad), distance: {distance:.4f}")
+    else:
+        camera_params = get_camera_params_wild_moge(
+            temp_processed_path, device="cuda",
+            mesh_scale=WILD_MESH_SCALE, extend_pixel=WILD_EXTEND_PIXEL,
+            image_resolution=WILD_IMAGE_RESOLUTION,
+        )
     _update_progress("Preprocessing & Camera Estimation", 1, 1)
     
     ss_sampler_override = {"steps": ss_sampling_steps, "guidance_strength": ss_guidance_strength,

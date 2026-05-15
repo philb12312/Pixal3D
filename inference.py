@@ -164,12 +164,10 @@ def run_inference(
     image_resolution: int = 512,
     max_num_tokens: int = 49152,
     model_path: str = MODEL_PATH,
+    manual_fov: float = -1.0,
 ):
     # Load models
     pipeline = init_pipeline(model_path)
-
-    print("[MoGe-2] Loading model for camera estimation...")
-    moge_model = load_moge_model(device="cuda")
 
     # Preprocess image
     print(f"[Inference] Processing image: {image_path}")
@@ -181,14 +179,28 @@ def run_inference(
     image_preprocessed.save(tmp_path)
 
     # Camera estimation
-    print("[Inference] Estimating camera parameters...")
-    camera_params = get_camera_params_wild_moge(
-        tmp_path, moge_model, device="cuda",
-        mesh_scale=mesh_scale, extend_pixel=extend_pixel,
-        image_resolution=image_resolution,
-    )
+    if manual_fov > 0:
+        # Use manually specified FOV (in radians)
+        camera_angle_x = float(manual_fov)
+        grid_point = torch.tensor([-1.0, 0.0, 0.0])
+        distance = distance_from_fov(
+            camera_angle_x, grid_point,
+            torch.tensor([0 - extend_pixel, image_resolution - 1 + extend_pixel]),
+            mesh_scale, image_resolution
+        )["distance_from_x"]
+        camera_params = {'camera_angle_x': camera_angle_x, 'distance': distance, 'mesh_scale': mesh_scale}
+        print(f"[Inference] Using manual FOV: {math.degrees(manual_fov):.2f}° ({manual_fov:.4f} rad), distance={distance:.4f}")
+    else:
+        print("[MoGe-2] Loading model for camera estimation...")
+        moge_model = load_moge_model(device="cuda")
+        print("[Inference] Estimating camera parameters...")
+        camera_params = get_camera_params_wild_moge(
+            tmp_path, moge_model, device="cuda",
+            mesh_scale=mesh_scale, extend_pixel=extend_pixel,
+            image_resolution=image_resolution,
+        )
+        print(f"  camera_angle_x={camera_params['camera_angle_x']:.4f}, distance={camera_params['distance']:.4f}")
     os.remove(tmp_path)
-    print(f"  camera_angle_x={camera_params['camera_angle_x']:.4f}, distance={camera_params['distance']:.4f}")
 
     # Run pipeline
     print("[Inference] Running 3D generation pipeline...")
@@ -253,6 +265,10 @@ if __name__ == "__main__":
     parser.add_argument("--image", type=str, required=True, help="Path to input image")
     parser.add_argument("--output", type=str, default="./output.glb", help="Output GLB file path")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--fov", type=float, default=-1.0,
+                        help="Manual camera FOV in radians (e.g. 0.2). "
+                             "If not set, FOV is auto-estimated via MoGe-2. "
+                             "Try 0.2 rad if you notice distortion.")
     parser.add_argument("--model_path", type=str, default=MODEL_PATH, help="Model path or HuggingFace repo")
 
     args = parser.parse_args()
@@ -261,5 +277,6 @@ if __name__ == "__main__":
         image_path=args.image,
         output_path=args.output,
         seed=args.seed,
+        manual_fov=args.fov,
         model_path=args.model_path,
     )

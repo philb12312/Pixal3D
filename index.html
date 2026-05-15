@@ -627,12 +627,19 @@
                     2. Click Extract GLB to export.<br>
                     3. Download the generated GLB file.
                 </p>
-                <p style="font-size: 0.72rem; color: var(--text-dim); line-height: 1.5; margin-top: 0.5rem; opacity: 0.7;">
-                    Note: Camera estimated automatically via MoGe-2.
-                </p>
                 <a href="https://ldyang694.github.io/projects/pixal3d/" target="_blank" class="btn btn-outline" style="margin-top: 1rem; padding: 0.6rem 1rem; font-size: 0.85rem;">
                     <i data-lucide="globe" style="width: 16px;"></i>
                     Project Page
+                </a>
+                <a href="https://huggingface.co/spaces/TencentARC/Pixal3D-Server" target="_blank" class="btn btn-outline" style="margin-top: 0.5rem; padding: 0.6rem 1rem; font-size: 0.85rem; flex-direction: column; gap: 0.25rem;">
+                    <div style="display: flex; align-items: center; gap: 0.5rem;">
+                        <i data-lucide="server" style="width: 16px;"></i>
+                        Free Deploy Server
+                    </div>
+                    <div style="display: flex; gap: 0.35rem;">
+                        <span style="background: linear-gradient(135deg, var(--accent), #059669); color: white; font-size: 0.55rem; font-weight: 700; padding: 0.1rem 0.45rem; border-radius: 4px; line-height: 1.4;">★ Recommended</span>
+                        <span style="background: linear-gradient(135deg, var(--primary), var(--primary-dark)); color: white; font-size: 0.55rem; font-weight: 700; padding: 0.1rem 0.45rem; border-radius: 4px; line-height: 1.4;">Free</span>
+                    </div>
                 </a>
             </div>
 
@@ -655,11 +662,37 @@
                             </button>
                         </div>
                     </div>
+                    <div class="input-wrapper">
+                        <p style="font-size: 0.72rem; color: var(--text-dim); line-height: 1.5; opacity: 0.7;">
+                            Note: FOV is auto-estimated via MoGe-2.<br>
+                            If distortion occurs, try manual FOV.<br>
+                            Default <b style="color: var(--primary);">0.2 rad</b> generally works well.
+                        </p>
+                    </div>
+                    <div class="input-wrapper">
+                        <label>
+                            Camera FOV
+                            <span style="display: flex; align-items: center; gap: 0.35rem;">
+                                <input type="checkbox" id="fov-auto" checked style="accent-color: var(--primary); width: 14px; height: 14px; cursor: pointer;">
+                                <span style="font-size: 0.75rem; color: var(--text-dim); cursor: pointer;" onclick="document.getElementById('fov-auto').click()">Auto</span>
+                            </span>
+                        </label>
+                        <div style="display: flex; gap: 0.5rem;">
+                            <input type="number" id="manual-fov" value="0.2" min="0.0175" max="2.9671" step="0.01" disabled style="opacity: 0.4; flex: 1;">
+                            <select id="fov-unit" disabled style="opacity: 0.4; width: 70px; padding: 0.5rem;">
+                                <option value="deg">deg</option>
+                                <option value="rad" selected>rad</option>
+                            </select>
+                        </div>
+                        <p id="fov-hint" style="font-size: 0.65rem; color: var(--text-dim); margin-top: 0.15rem;">
+                            Manual FOV in radians (0.02–2.97 rad)
+                        </p>
+                    </div>
                 </div>
             </div>
 
             <div class="sidebar-section" id="render-controls" style="display: none;">
-                <h3><i data-lucide="palette" style="width: 14px;"></i> Render Mode</h3>
+                <h3><i data-lucide="palette" style="width: 14px;"></i> Render Mode For Preview</h3>
                 <div class="mode-grid" id="mode-grid">
                     <!-- Tabs injected via JS -->
                 </div>
@@ -904,7 +937,7 @@
                 document.getElementById('angle-display').textContent = '00';
 
                 // Reset 3D viewer
-                document.getElementById('main-3d-viewer').removeAttribute('src');
+                resetModelViewer();
 
                 // Reset thumbnails
                 document.getElementById('ref-thumb-2').style.display = 'none';
@@ -932,6 +965,38 @@
                 currentFrame = parseInt(e.target.value);
                 document.getElementById('angle-display').textContent = (currentFrame * 22.5).toFixed(0).padStart(2, '0');
                 updateFrame();
+            };
+
+            // FOV auto toggle & unit switch
+            const fovAutoCheck = document.getElementById('fov-auto');
+            const fovInput = document.getElementById('manual-fov');
+            const fovUnit = document.getElementById('fov-unit');
+            const fovHint = document.getElementById('fov-hint');
+
+            function updateFovEnabled() {
+                const manual = !fovAutoCheck.checked;
+                fovInput.disabled = !manual;
+                fovUnit.disabled = !manual;
+                fovInput.style.opacity = manual ? '1' : '0.4';
+                fovUnit.style.opacity = manual ? '1' : '0.4';
+            }
+
+            fovAutoCheck.onchange = updateFovEnabled;
+
+            fovUnit.onchange = () => {
+                const val = parseFloat(fovInput.value);
+                if (isNaN(val)) return;
+                if (fovUnit.value === 'rad') {
+                    // deg -> rad
+                    fovInput.value = (val * Math.PI / 180).toFixed(4);
+                    fovInput.min = '0.0175'; fovInput.max = '2.9671'; fovInput.step = '0.01';
+                    fovHint.textContent = 'Manual FOV in radians (0.02–2.97 rad)';
+                } else {
+                    // rad -> deg
+                    fovInput.value = (val * 180 / Math.PI).toFixed(1);
+                    fovInput.min = '1'; fovInput.max = '170'; fovInput.step = '0.5';
+                    fovHint.textContent = 'Uncheck "Auto" to manually set FOV (1°–170°)';
+                }
             };
 
             // Mode Grid
@@ -1005,6 +1070,18 @@
         async function startGeneration() {
             if (!currentFile) return;
 
+            // Clear old preview frames and 3D result
+            generationResult = null;
+            document.getElementById('frame-container').innerHTML = '';
+            document.getElementById('angle-slider').value = 0;
+            document.getElementById('angle-display').textContent = '00';
+            resetModelViewer();
+            document.getElementById('extract-btn').style.display = 'none';
+            document.getElementById('download-btn').style.display = 'none';
+
+            // Stay on step 1 during generation
+            setStep(1);
+
             showLoading();
             startProgressListener();
             try {
@@ -1015,6 +1092,11 @@
                     ss_guidance_strength: parseFloat(document.getElementById('ss_gs').value),
                     ss_sampling_steps: parseInt(document.getElementById('ss_steps').value),
                     shape_slat_guidance_strength: parseFloat(document.getElementById('shape_gs').value),
+                    manual_fov: (() => {
+                        if (document.getElementById('fov-auto').checked) return -1.0;
+                        const v = parseFloat(document.getElementById('manual-fov').value);
+                        return document.getElementById('fov-unit').value === 'rad' ? v * 180 / Math.PI : v;
+                    })(),
                     session_id: sessionId
                 };
 
@@ -1042,8 +1124,8 @@
             }
         }
 
-        // SSE Progress Listener
-        let progressEventSource = null;
+        // Progress Polling
+        let progressInterval = null;
         let lastStageName = "";
         
         function startProgressListener() {
@@ -1055,26 +1137,25 @@
             document.getElementById('progress-bar-fill').style.width = '0%';
             lastStageName = "";
 
-            progressEventSource = new EventSource(`/progress?session_id=${sessionId}`);
-            progressEventSource.onmessage = (event) => {
+            // Poll every 500ms instead of SSE
+            progressInterval = setInterval(async () => {
                 try {
-                    const data = JSON.parse(event.data);
+                    const resp = await fetch(`/progress?session_id=${sessionId}`);
+                    if (!resp.ok) return;
+                    const data = await resp.json();
                     if (data.done) {
                         stopProgressListener();
                         return;
                     }
                     updateProgressUI(data);
                 } catch (e) {}
-            };
-            progressEventSource.onerror = () => {
-                // Silently ignore SSE errors, generation continues
-            };
+            }, 500);
         }
 
         function stopProgressListener() {
-            if (progressEventSource) {
-                progressEventSource.close();
-                progressEventSource = null;
+            if (progressInterval) {
+                clearInterval(progressInterval);
+                progressInterval = null;
             }
         }
 
@@ -1139,12 +1220,36 @@
             if (active) active.classList.add('active');
         }
 
+        // Destroy and recreate model-viewer to fully purge old mesh from WebGL
+        function resetModelViewer() {
+            const container = document.querySelector('#panel-3 .viewer-wrapper');
+            const old = document.getElementById('main-3d-viewer');
+            if (old) old.remove();
+            const mv = document.createElement('model-viewer');
+            mv.id = 'main-3d-viewer';
+            mv.setAttribute('camera-controls', '');
+            mv.setAttribute('auto-rotate', '');
+            mv.setAttribute('camera-orbit', '-180deg 90deg auto');
+            mv.setAttribute('shadow-intensity', '1.5');
+            mv.setAttribute('environment-image', 'neutral');
+            mv.setAttribute('exposure', '1.2');
+            mv.style.width = '100%';
+            mv.style.height = '100%';
+            mv.style.background = 'radial-gradient(circle at 50% 50%, #1a2235 0%, #0b0f1a 100%)';
+            mv.style.visibility = 'hidden';
+            mv.innerHTML = '<div slot="progress-bar" style="background: var(--primary); height: 4px;"></div>';
+            container.appendChild(mv);
+            return mv;
+        }
+
         async function startExtraction() {
             if (!generationResult) return;
 
-            // Clear previous model immediately so it won't show during loading
-            const viewer = document.getElementById('main-3d-viewer');
-            viewer.removeAttribute('src');
+            // Switch away from panel-3 immediately so user won't see stale mesh
+            if (currentStep === 3) setStep(2);
+
+            // Destroy old model-viewer and create a fresh one (purges WebGL scene completely)
+            const viewer = resetModelViewer();
 
             showLoading();
             startProgressListener();
@@ -1160,13 +1265,37 @@
                 const glbUrl = result.data[0].url;
 
                 stopProgressListener();
-                viewer.src = glbUrl;
+
+                // Wait for the new model to fully load before revealing (with timeout fallback)
+                await new Promise((resolve) => {
+                    let settled = false;
+                    const onLoad = () => {
+                        if (settled) return;
+                        settled = true;
+                        viewer.removeEventListener('load', onLoad);
+                        clearTimeout(timer);
+                        resolve();
+                    };
+                    // Timeout fallback: if load event never fires (e.g. model-viewer error),
+                    // resolve anyway after 30s to avoid permanent hang
+                    const timer = setTimeout(() => {
+                        if (settled) return;
+                        settled = true;
+                        viewer.removeEventListener('load', onLoad);
+                        resolve();
+                    }, 30000);
+                    viewer.addEventListener('load', onLoad);
+                    viewer.src = glbUrl;
+                });
+
+                viewer.style.visibility = 'visible';
                 setStep(3);
                 hideLoading();
                 showToast("3D Asset ready!");
             } catch (err) {
                 console.error(err);
                 stopProgressListener();
+                viewer.style.visibility = 'visible';
                 hideLoading();
                 showToast("Extraction failed.");
             }
@@ -1182,7 +1311,6 @@
                 'assets/images/5_img.webp',
                 'assets/images/6_img.png',
                 'assets/images/7_img.png',
-                'assets/images/8_img.png',
                 'assets/images/9_img.png',
                 'assets/images/10_img.webp',
                 'assets/images/11_img.png',
@@ -1194,8 +1322,15 @@
                 'assets/images/s_15_img.png',
                 'assets/images/s_16_img.png',
                 'assets/images/s_18_img.png',
-                'assets/images/s_19_img.png',
-                'assets/images/s_20_img.webp'
+                'assets/images/s_20_img.webp',
+                'assets/images/musicman.png',
+                'assets/images/pizza.png',
+                'assets/images/sculpt.png',
+                'assets/images/treehouse.png',
+                'assets/images/warship.png',
+                'assets/images/5c80e5e03a3b60b6f03eaf555ba1dafc0e4230c472d7e8c8e2c5ca0a0dfcef10.webp',
+                'assets/images/c9340e744541f310bf89838f652602961d3e5950b31cd349bcbfc7e59e15cd2e.webp',
+                'assets/images/f94e2b76494ce2cf1874611273e5fb3d76b395793bb5647492fa85c2ce0a248b.webp'
             ];
 
             // Create track element
