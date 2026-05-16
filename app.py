@@ -4,6 +4,7 @@ import argparse
 import math
 import time
 import shutil
+import sys
 import cv2
 import torch
 import numpy as np
@@ -30,16 +31,28 @@ os.environ["ATTN_BACKEND"] = "flash_attn_3"
 os.environ["FLEX_GEMM_AUTOTUNE_CACHE_PATH"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'autotune_cache.json')
 os.environ["FLEX_GEMM_AUTOTUNER_VERBOSE"] = '1'
 
-import spaces
+try:
+    import spaces
+except ImportError:
+    class _SpacesFallback:
+        @staticmethod
+        def GPU(duration=None):
+            def decorator(func):
+                return func
+
+            return decorator
+
+    spaces = _SpacesFallback()
+
 from gradio import Server
 from gradio.data_classes import FileData
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from trellis2.modules.sparse import SparseTensor
-from trellis2.pipelines import Pixal3DImageTo3DPipeline
-from trellis2.renderers import EnvMap
-from trellis2.utils import render_utils
+from pixal3d.modules.sparse import SparseTensor
+from pixal3d.pipelines import Pixal3DImageTo3DPipeline
+from pixal3d.renderers import EnvMap
+from pixal3d.utils import render_utils
 import o_voxel
 
 # ============================================================================
@@ -104,8 +117,19 @@ IMAGE_COND_CONFIGS = {
 # Model Loading
 # ============================================================================
 
+def should_use_low_vram(min_full_vram_gb: float = 24.0) -> bool:
+    override = os.environ.get("PIXAL3D_LOW_VRAM")
+    if override is not None:
+        return override.lower() in {"1", "true", "yes", "on"}
+
+    if not torch.cuda.is_available():
+        return True
+
+    total_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    return total_memory_gb < min_full_vram_gb
+
 def build_image_cond_model(config: dict):
-    from trellis2.trainers.flow_matching.mixins.image_conditioned_proj import DinoV3ProjFeatureExtractor
+    from pixal3d.trainers.flow_matching.mixins.image_conditioned_proj import DinoV3ProjFeatureExtractor
     model = DinoV3ProjFeatureExtractor(**config)
     model.eval()
     return model
@@ -157,14 +181,15 @@ def init_models():
         pipeline.image_cond_model_shape_1024 = build_image_cond_model(IMAGE_COND_CONFIGS["shape_1024"])
         pipeline.image_cond_model_tex_1024 = build_image_cond_model(IMAGE_COND_CONFIGS["tex_1024"])
         
-        pipeline.low_vram = False
+        pipeline.low_vram = should_use_low_vram()
+        print(f"[Memory] low_vram={pipeline.low_vram}")
         pipeline.cuda()
-        
-        # Ensure image_cond_models are on GPU
-        pipeline.image_cond_model_ss.cuda()
-        pipeline.image_cond_model_shape_512.cuda()
-        pipeline.image_cond_model_shape_1024.cuda()
-        pipeline.image_cond_model_tex_1024.cuda()
+
+        if not pipeline.low_vram:
+            pipeline.image_cond_model_ss.cuda()
+            pipeline.image_cond_model_shape_512.cuda()
+            pipeline.image_cond_model_shape_1024.cuda()
+            pipeline.image_cond_model_tex_1024.cuda()
         
         print("[NAF] Pre-loading NAF upsampler model...")
         for attr in ['image_cond_model_ss', 'image_cond_model_shape_512', 'image_cond_model_shape_1024', 'image_cond_model_tex_1024']:
@@ -309,9 +334,9 @@ class _TqdmProgressInterceptor(_original_tqdm):
 # Patch tqdm globally
 _tqdm_module.tqdm = _TqdmProgressInterceptor
 # Also patch the direct import in the sampler module and render_utils
-import trellis2.pipelines.samplers.flow_euler as _fe_module
+import pixal3d.pipelines.samplers.flow_euler as _fe_module
 _fe_module.tqdm = _TqdmProgressInterceptor
-import trellis2.utils.render_utils as _ru_module
+import pixal3d.utils.render_utils as _ru_module
 _ru_module.tqdm = _TqdmProgressInterceptor
 import o_voxel.postprocess as _ovp_module
 _ovp_module.tqdm = _TqdmProgressInterceptor
@@ -502,11 +527,15 @@ app.mount("/tmp", StaticFiles(directory=TMP_DIR), name="tmp")
 if __name__ == "__main__":
     # Re-install utils3d as in original app.py
     subprocess.run([
-        "pip", "install", "--force-reinstall", "--no-deps",
+        sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps",
         "https://github.com/LDYang694/Storages/releases/download/20260430/utils3d-0.0.2-py3-none-any.whl"
     ], check=True)
-    
-    # Pre-initialize models before launching the server
-    init_models()
-    
-    app.launch(show_error=True, share=True)
+
+    preload_models = os.environ.get("PIXAL3D_PRELOAD", "0").lower() in {"1", "true", "yes", "on"}
+    if preload_models:
+        init_models()
+    else:
+        print("[Startup] Skipping eager model preload; models will load on first request.")
+
+    share = os.environ.get("PIXAL3D_SHARE", "0").lower() in {"1", "true", "yes", "on"}
+    app.launch(show_error=True, share=share)

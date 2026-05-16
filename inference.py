@@ -56,6 +56,17 @@ IMAGE_COND_CONFIGS = {
 # Model Loading
 # ============================================================================
 
+def should_use_low_vram(min_full_vram_gb: float = 24.0) -> bool:
+    override = os.environ.get("PIXAL3D_LOW_VRAM")
+    if override is not None:
+        return override.lower() in {"1", "true", "yes", "on"}
+
+    if not torch.cuda.is_available():
+        return True
+
+    total_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    return total_memory_gb < min_full_vram_gb
+
 def build_image_cond_model(config: dict):
     from pixal3d.trainers.flow_matching.mixins.image_conditioned_proj import DinoV3ProjFeatureExtractor
     model = DinoV3ProjFeatureExtractor(**config)
@@ -80,13 +91,15 @@ def init_pipeline(model_path=MODEL_PATH, device="cuda"):
     pipeline.image_cond_model_shape_1024 = build_image_cond_model(IMAGE_COND_CONFIGS["shape_1024"])
     pipeline.image_cond_model_tex_1024 = build_image_cond_model(IMAGE_COND_CONFIGS["tex_1024"])
 
-    pipeline.low_vram = False
+    pipeline.low_vram = should_use_low_vram()
+    print(f"[Memory] low_vram={pipeline.low_vram}")
     pipeline.cuda()
 
-    pipeline.image_cond_model_ss.cuda()
-    pipeline.image_cond_model_shape_512.cuda()
-    pipeline.image_cond_model_shape_1024.cuda()
-    pipeline.image_cond_model_tex_1024.cuda()
+    if not pipeline.low_vram:
+        pipeline.image_cond_model_ss.cuda()
+        pipeline.image_cond_model_shape_512.cuda()
+        pipeline.image_cond_model_shape_1024.cuda()
+        pipeline.image_cond_model_tex_1024.cuda()
 
     print("[NAF] Pre-loading NAF upsampler model...")
     for attr in ['image_cond_model_ss', 'image_cond_model_shape_512', 'image_cond_model_shape_1024', 'image_cond_model_tex_1024']:

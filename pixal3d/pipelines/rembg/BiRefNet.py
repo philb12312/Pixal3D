@@ -1,3 +1,4 @@
+import os
 from typing import *
 from transformers import AutoModelForImageSegmentation
 import torch
@@ -6,10 +7,34 @@ from PIL import Image
 
 
 class BiRefNet:
-    def __init__(self, model_name: str = "ZhengPeng7/BiRefNet"):
-        self.model = AutoModelForImageSegmentation.from_pretrained(
-            model_name, trust_remote_code=True
+    def __init__(
+        self,
+        model_name: str = "ZhengPeng7/BiRefNet",
+        fallback_model_name: Optional[str] = None,
+    ):
+        requested_model_name = os.environ.get("PIXAL3D_REMBG_MODEL", model_name)
+        fallback_model_name = (
+            fallback_model_name
+            or os.environ.get("PIXAL3D_REMBG_FALLBACK_MODEL")
+            or "ZhengPeng7/BiRefNet"
         )
+
+        try:
+            self.model = AutoModelForImageSegmentation.from_pretrained(
+                requested_model_name, trust_remote_code=True
+            )
+        except Exception as exc:
+            if requested_model_name == fallback_model_name:
+                raise
+
+            print(
+                f"[Rembg] Failed to load {requested_model_name}: {exc}. "
+                f"Falling back to {fallback_model_name}."
+            )
+            self.model = AutoModelForImageSegmentation.from_pretrained(
+                fallback_model_name, trust_remote_code=True
+            )
+
         self.model.eval()
         self.transform_image = transforms.Compose(
             [
